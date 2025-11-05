@@ -527,3 +527,229 @@ plt.tight_layout()
 plt.show()
 
 
+# --- RF / link model helper functions ---
+def deg2rad(d): return d * np.pi / 180.0
+
+def antenna_gain_from_beamwidth_deg(hpbw_deg):
+    """
+    Approximate antenna gain (dBi) from half-power beamwidth in degrees.
+    Empirical approximation: G(dBi) ≈ 10*log10(32400 / theta^2)
+    (useful engineering approximation for parabolic-like patterns).
+    """
+    theta = np.maximum(hpbw_deg, 0.1)
+    g = 10.0 * np.log10(32400.0 / (theta**2))
+    return g
+
+def fspl_dB(range_m, frequency_hz):
+    """Free-space path loss in dB for range (m) and frequency (Hz)."""
+    c = 3e8
+    lam = c / frequency_hz
+    return 20*np.log10(4*np.pi*range_m / lam)
+
+def noise_power_dBW(bandwidth_hz, noise_temp_k=500.0):
+    """Thermal noise power in dBW over bandwidth (Hz). noise_temp_k includes system noise figure."""
+    k = 1.380649e-23
+    noise_watts = k * noise_temp_k * bandwidth_hz
+    return 10*np.log10(noise_watts) if noise_watts > 0 else -1e9
+
+def snr_dB(eirp_dBW, g_rx_dBi, fspl_dB, other_losses_dB, noise_dBW):
+    """SNR in dB at receiver."""
+    return eirp_dBW + g_rx_dBi - fspl_dB - other_losses_dB - noise_dBW
+
+def spectral_efficiency_from_snr_db(snr_db, cap_bps_hz=6.0):
+    """Shannon spectral efficiency (bps/Hz) capped to a practical maximum."""
+    snr_lin = 10**(snr_db/10.0)
+    se = np.log2(1.0 + snr_lin)
+    # cap to a reasonable maximum (implementation/modcod limits)
+    return np.minimum(se, cap_bps_hz)
+
+def capacity_from_params(beam_hpbw_deg,
+                         sat_tx_power_w=100.0,
+                         freq_ghz=20.0,
+                         beam_bandwidth_hz=200e6,
+                         sat_tx_losses_dB=2.0,
+                         user_rx_gain_dBi=30.0,
+                         sys_noise_temp_k=500.0,
+                         slant_range_km=600.0,
+                         other_losses_dB=2.0,
+                         se_cap_bps_hz=6.0):
+    """
+    Computes approximate per-beam capacity (Mbps) using simple link-budget -> Shannon mapping.
+    Returns: capacity_mbps, snr_db, se_bps_hz
+    """
+    freq_hz = freq_ghz * 1e9
+    range_m = slant_range_km * 1000.0
+    # TX antenna gain from beamwidth
+    g_tx_dBi = antenna_gain_from_beamwidth_deg(beam_hpbw_deg)
+    # EIRP in dBW
+    pt_dBW = 10*np.log10(sat_tx_power_w) if sat_tx_power_w > 0 else -1e9
+    eirp_dBW = pt_dBW + g_tx_dBi - sat_tx_losses_dB
+    # FSPL
+    fspl = fspl_dB(range_m, freq_hz)
+    # Noise
+    noise_dBW = noise_power_dBW(beam_bandwidth_hz, sys_noise_temp_k)
+    # SNR (dB)
+    snr = snr_dB(eirp_dBW, user_rx_gain_dBi, fspl, other_losses_dB, noise_dBW)
+    se = spectral_efficiency_from_snr_db(snr, cap_bps_hz=se_cap_bps_hz)
+    capacity_bps = se * beam_bandwidth_hz
+    capacity_mbps = capacity_bps / 1e6
+    return capacity_mbps, snr, se
+
+# --- Example baseline parameters (tune these) ---
+beam_hpbw_deg_by_scheme = {
+    # assume dynamic beams are narrower (steered), fixed beams wider
+    "fixed-beam": 6.0,        # degrees HPBW
+    "dynamic-beamforming": 3.0,
+    "demand-aware-handovers": 6.0
+}
+sat_tx_power_w = 100.0          # per-beam transmit power (W)
+freq_ghz = 20.0                 # Ka-band example
+beam_bandwidth_hz = 200e6       # Hz per beam
+sys_noise_temp_k = 500.0
+user_gain_by_scenario = {"urban": 25.0, "rural": 30.0, "remote": 35.0}  # dBi
+
+slant_range_km = 600.0
+other_losses_dB = 2.0
+sat_tx_losses_dB = 2.0
+se_cap_bps_hz = 6.0
+
+# compute per-scheme beam capacities (single scalar per-beam)
+beam_capacity_by_scheme = {}
+for scheme, hp in beam_hpbw_deg_by_scheme.items():
+    # choose a representative user gain (use average across scenarios)
+    avg_user_gain = np.mean(list(user_gain_by_scenario.values()))
+    cap_mbps, snr_db, se_bps_hz = capacity_from_params(
+        beam_hpbw_deg=hp,
+        sat_tx_power_w=sat_tx_power_w,
+        freq_ghz=freq_ghz,
+        beam_bandwidth_hz=beam_bandwidth_hz,
+        sat_tx_losses_dB=sat_tx_losses_dB,
+        user_rx_gain_dBi=avg_user_gain,
+        sys_noise_temp_k=sys_noise_temp_k,
+        slant_range_km=slant_range_km,
+        other_losses_dB=other_losses_dB,
+        se_cap_bps_hz=se_cap_bps_hz
+    )
+    beam_capacity_by_scheme[scheme] = {
+        "capacity_mbps": cap_mbps,
+        "snr_db": snr_db,
+        "se_bps_hz": se_bps_hz,
+        "hp_bw_deg": hp
+    }
+
+print("Per-beam capacity estimates (Mbps):")
+for s, v in beam_capacity_by_scheme.items():
+    print(f"  {s}: {v['capacity_mbps']:.1f} Mbps (SNR={v['snr_db']:.1f} dB, SE={v['se_bps_hz']:.2f} bps/Hz)")
+
+# --- Integrate beam capacity into simulation runner ---
+# We'll update simulate_scheme to accept per-beam capacity scalar (so just pass scalar capacity)
+# (If you previously defined simulate_scheme to use a fixed capacity variable, you can call it with capacity=...)
+
+# --- Congestion sweep ---
+# Sweep axes:
+#  - offered_load_scale: multiply all user base bandwidths by this factor to create congested scenarios
+#  - beam_count_values: vary number of beams (reduces coverage granularity and total network capacity)
+offered_load_scales = [0.5, 1.0, 1.5, 2.0, 3.0]   # 1.0 is baseline offered load
+beam_count_values = [8, 16, 32]
+
+# We'll run schemes: fixed-beam, dynamic-beamforming, demand-aware-handovers
+schemes_list = ['fixed-beam', 'dynamic-beamforming', 'demand-aware-handovers']
+
+# reuse get_dynamic_centers, grid_centers, etc. from previous cell if available; else build a simple grid
+# get user bounding box:
+all_users_df = pd.concat([results[s]["labeled_df"].reset_index(drop=True) for s in results])
+x_min, x_max = all_users_df['x_km'].min(), all_users_df['x_km'].max()
+y_min, y_max = all_users_df['y_km'].min(), all_users_df['y_km'].max()
+
+def make_grid_centers(N_beams, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max):
+    grid_n = int(np.ceil(np.sqrt(N_beams)))
+    xs = np.linspace(x_min, x_max, grid_n)
+    ys = np.linspace(y_min, y_max, grid_n)
+    grid_centers = np.array([(x,y) for x in xs for y in ys])[:N_beams]
+    return grid_centers
+
+# Prepare results storage
+rows = []
+for N_beams in beam_count_values:
+    fixed_centers = make_grid_centers(N_beams)
+    dynamic_centers = get_dynamic_centers(results, N_beams) if 'get_dynamic_centers' in globals() else fixed_centers.copy()
+    handover_centers = fixed_centers.copy()
+    centers_dict = {
+        'fixed-beam': fixed_centers,
+        'dynamic-beamforming': dynamic_centers,
+        'demand-aware-handovers': handover_centers
+    }
+    for scale in offered_load_scales:
+        # scale base bandwidths in-place temporarily (we'll multiply demand matrices inside simulate routine instead)
+        # We'll create a wrapper to scale demands when calling simulate_scheme
+        def simulate_scheme_scaled(name, centers, scale_factor, beam_capacity_mbps):
+            # wrapper: temporarily scale base bandwidths in results by multiplying base_bandwidth_mbps
+            # create a deep copy of results[sc]['labeled_df'] for simulation so we don't modify original
+            results_copy = {}
+            for sc in results:
+                df = results[sc]['labeled_df'].copy().reset_index(drop=True)
+                df['base_bandwidth_mbps'] = df['base_bandwidth_mbps'] * scale_factor
+                results_copy[sc] = {'labeled_df': df, 'cluster_stats': results[sc].get('cluster_stats', pd.DataFrame())}
+            return simulate_scheme(name, centers, results_copy, hours=24, capacity=beam_capacity_mbps)
+        
+        for scheme_name in schemes_list:
+            # pick beam capacity from beam model using scheme hp bw
+            cap_mbps = beam_capacity_by_scheme[scheme_name]['capacity_mbps']
+            # NOTE: if you want total system capacity to scale with number of beams, then total capacity = cap_mbps * N_beams
+            # simulate
+            agg = simulate_scheme_scaled(scheme_name, centers_dict[scheme_name], scale, cap_mbps)
+            rows.append({
+                'N_beams': N_beams,
+                'offered_scale': scale,
+                'scheme': scheme_name,
+                'total_requested_Mbps': agg['total_requested'],
+                'total_served_Mbps': agg['total_served'],
+                'pct_served': 100.0 * agg['total_served'] / agg['total_requested'] if agg['total_requested']>0 else 0.0,
+                'avg_blocking_fraction': agg['avg_blocking_fraction'],
+                'avg_fairness': agg['avg_fairness']
+            })
+
+# Build DataFrame
+congestion_df = pd.DataFrame(rows)
+
+# Pivot / plotting
+print("\n=== Congestion Sweep Summary (sample) ===")
+display(congestion_df.head(12))
+
+# Plot percent served vs offered load for each scheme and beam count
+plt.figure(figsize=(10,6))
+for scheme_name in schemes_list:
+    for N_beams in beam_count_values:
+        sub = congestion_df[(congestion_df['scheme']==scheme_name) & (congestion_df['N_beams']==N_beams)]
+        plt.plot(sub['offered_scale'], sub['pct_served'], marker='o', label=f"{scheme_name}, beams={N_beams}")
+plt.xlabel("Offered load scale factor")
+plt.ylabel("Percent of demand served (%)")
+plt.title("Percent served vs Offered Load — schemes and beam counts")
+plt.legend(fontsize='small', ncol=2)
+plt.grid(True)
+plt.show()
+
+# Plot blocking fraction heatmap (avg blocking) as function of N_beams and offered scale for each scheme
+for scheme_name in schemes_list:
+    pivot = congestion_df[congestion_df['scheme']==scheme_name].pivot(index='N_beams', columns='offered_scale', values='avg_blocking_fraction')
+    plt.figure(figsize=(6,3))
+    plt.title(f"Avg Blocking Fraction — {scheme_name}")
+    plt.imshow(pivot.values, aspect='auto', origin='lower', cmap='Reds', vmin=0, vmax=1)
+    plt.colorbar(label='Blocking fraction')
+    plt.xticks(ticks=np.arange(len(pivot.columns)), labels=pivot.columns)
+    plt.yticks(ticks=np.arange(len(pivot.index)), labels=pivot.index)
+    plt.xlabel('Offered load scale')
+    plt.ylabel('N_beams')
+    plt.show()
+
+# Show final summary table aggregated by scheme (average over sweep)
+summary_by_scheme = congestion_df.groupby('scheme').agg({
+    'pct_served':'mean',
+    'avg_blocking_fraction':'mean',
+    'avg_fairness':'mean'
+}).reset_index()
+print("\n=== Aggregate summary by scheme (averaged over sweep) ===")
+print(summary_by_scheme)
+
+
+
