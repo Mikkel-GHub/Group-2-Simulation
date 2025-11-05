@@ -162,4 +162,88 @@ for label, result in results.items():
     plt.grid(True)
     plt.show()
     
+
+
+# ==============================
+# 3. Traffic Demand Simulation
+# ==============================
+
+# --- Define service profiles ---
+service_profiles = {
+    "IoT": {"bandwidth_range": (0.01, 0.1), "prob": {"urban": 0.4, "rural": 0.3, "remote": 0.5}},
+    "Broadband": {"bandwidth_range": (1, 50), "prob": {"urban": 0.5, "rural": 0.6, "remote": 0.45}},
+    "Critical": {"bandwidth_range": (5, 20), "prob": {"urban": 0.1, "rural": 0.1, "remote": 0.05}}
+}
+
+def assign_profiles(df, scenario):
+    choices = list(service_profiles.keys())
+    probs = [service_profiles[p]["prob"][scenario] for p in choices]
+    df = df.copy()
+    df["service_profile"] = np.random.choice(choices, size=len(df), p=probs)
     
+    # Assign base bandwidth request
+    bw = []
+    for profile in df["service_profile"]:
+        low, high = service_profiles[profile]["bandwidth_range"]
+        bw.append(np.random.uniform(low, high))
+    df["base_bandwidth_mbps"] = bw
+    return df
+
+# Apply profiles to each scenario
+for label in scenarios:
+    results[label]["labeled_df"] = assign_profiles(results[label]["labeled_df"], label)
+
+# --- Time-of-day demand patterns (normalized multipliers) ---
+time_curve = {
+    "urban":   [0.6,0.5,0.4,0.5,0.7,0.9,1.0,1.2,1.1,1.0,0.9,0.8,  # 0–11h
+                0.8,0.9,1.0,1.2,1.3,1.4,1.2,1.1,1.0,0.8,0.7,0.6], # 12–23h
+    "rural":   [0.5,0.4,0.3,0.3,0.4,0.6,0.8,1.0,1.0,0.9,0.8,0.7,
+                0.7,0.8,0.9,1.1,1.2,1.3,1.1,1.0,0.9,0.7,0.6,0.5],
+    "remote":  [0.6,0.6,0.5,0.5,0.6,0.7,0.8,0.9,0.9,0.8,0.7,0.7,
+                0.7,0.8,0.9,1.0,1.0,1.1,1.0,0.9,0.8,0.7,0.7,0.6]
+}
+
+# --- Simulate time-varying demand ---
+def simulate_demand(df, scenario, hours=24):
+    df = df.copy()
+    demands = []
+    for h in range(hours):
+        multiplier = time_curve[scenario][h]
+        hour_demand = df["base_bandwidth_mbps"] * multiplier
+        demands.append(hour_demand.values)
+    demand_matrix = np.array(demands)  # shape (hours, users)
+    return demand_matrix
+
+# Example: simulate for urban
+urban_demand_matrix = simulate_demand(results["urban"]["labeled_df"], "urban")
+
+# --- Plot average demand over time for each scenario ---
+for scenario in scenarios:
+    df = results[scenario]["labeled_df"]
+    demand_matrix = simulate_demand(df, scenario)
+    avg_demand = demand_matrix.mean(axis=1)
+    plt.plot(range(24), avg_demand, label=scenario)
+
+plt.title("Average User Demand vs Time of Day")
+plt.xlabel("Hour of Day")
+plt.ylabel("Bandwidth (Mbps)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# --- Plot cumulative (total) traffic demand over time for each scenario ---
+plt.figure(figsize=(8,5))
+for scenario in scenarios:
+    df = results[scenario]["labeled_df"]
+    demand_matrix = simulate_demand(df, scenario)
+    total_demand = demand_matrix.sum(axis=1)  # total Mbps at each hour
+    plt.plot(range(24), total_demand, label=scenario)
+
+plt.title("Cumulative Traffic Demand vs Time of Day")
+plt.xlabel("Hour of Day")
+plt.ylabel("Total Bandwidth Demand (Mbps)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
